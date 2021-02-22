@@ -49,26 +49,53 @@ title="Status Dashboard"
 # Use CGI mode
 cgi=false
 
+# Callback URL for failed checks. Script will do a POST request with
+# the following parameters: urlencode(url), name, expected_status, actual_status, error.
+callbackURL=""
+
 # Start of script. Do not edit below
 # Exit immediately if a command exits with a non-zero status.
 set -e
 # patterns which match no files expand to a null string, otherwise later on we'd have *.status as a file...
 shopt -s nullglob
 
+# helper functions
+command_exists() {
+    # check if command exists and fail otherwise
+    command -v "$1" >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        echo "I require '$1' but it's not installed. Please install it. Aborting."
+        exit 1
+    fi
+}
+
+# environment checks
+[ "${BASH_VERSINFO:-0}" -lt 4 ] && { echo "I require at least Bash version 4. Aborting." >&2 ; exit 2; }
+command_exists curl
+
+case "$(uname -s)" in
+  Darwin*)
+    datecmd="gdate"
+    command_exists "${datecmd}"
+    ;;
+  *)
+    datecmd="date"
+esac
+
 # start of the function definitions
 
-# This function allows the script to execute all the curl calls in paralell. 
+# This function allows the script to execute all the curl calls in parallel. 
 # Otherwise, if one would timeout or take long, the rest after that would be
 # slower. We're writing the status code to a file, reading that later on. Why? 
 # Because an array cannot be filled via a subprocess (curl ... &)
 doRequest() {
   name="${1}"
   url="${2}"
-  checkStartTimeMs="$(date +%s%3N)" # epoch in microseconds, but last chars stripped so it's milliseconds
+  checkStartTimeMs="$(${datecmd} +%s%3N)" # epoch in microseconds, but last chars stripped so it's milliseconds
   set +e # curl errors don't count for early exit, turn off e
   checkStatusCode="$(curl --max-time "${defaultTimeOut}" --silent --show-error --insecure --output /dev/null --write-out "%{http_code}" "$url" --stderr "${tempfolder}/FAIL/${name}.error")"
   set -e # turn e back on
-  checkEndTimeMs="$(date +%s%3N)"
+  checkEndTimeMs="$(${datecmd} +%s%3N)"
   timeCheckTook="$((checkEndTimeMs-checkStartTimeMs))"
 
   expectedStatusCode=${defaultExpectedStatusCode}
@@ -139,6 +166,58 @@ writeOkayChecks() {
       fi
     done
   fi
+  popd >/dev/null 2>&1
+}
+
+urlencode() {
+  local LANG=C 
+  local i='' 
+  local c='' 
+  local e=''
+  for ((i=0; i<${#1}; i++)); do
+    c=${1:$i:1}
+    [[ "$c" =~ [a-zA-Z0-9\.\~\_\-] ]] || printf -v c '%%%02X' "'$c"
+    e+="$c"
+  done
+  echo "$e"
+}
+
+doCallbackForFailedChecks() {
+  # If the callback URL is empty, don't do anything.
+  if [[ -z "${callbackURL}" ]]; then
+    return;
+  fi
+
+  pushd "${tempfolder}/FAIL" >/dev/null 2>&1
+  failFiles=(*.status)
+  failCount=${#failFiles[@]}
+  for filename in "${failFiles[@]}"; do
+    if [[ -r $filename ]]; then
+      filenameWithoutExt=${filename%.*}
+      if [[ -r "${filenameWithoutExt}.error" ]]; then
+        curlError="$(cat "${filenameWithoutExt}.error" 2>/dev/null)"
+      else
+        curlError="Status code does not match expected code"
+      fi
+      url="${urls[${filenameWithoutExt}]}"
+      encodedUrl="$(urlencode ${url})"
+      currentStatus="$(cat "${filename}")"
+      expectedStatus="000"
+      if [[ -z "${statuscode[${filenameWithoutExt}]}" ]]; then
+        expectedStatus="${defaultExpectedStatusCode}"
+      else
+        expectedStatus="${statuscode[${filenameWithoutExt}]}"
+      fi
+
+      curlData="{\"url\":\"${encodedUrl}\",\"name\":\"${filenameWithoutExt}\",\"expected_status\":\"${expectedStatus}\",\"actual_status\":\"${currentStatus}\",\"error\":\"${curlError}\"}";
+      echo "${curlData}"
+
+      curl --max-time "${defaultTimeOut}" --silent --show-error --insecure --output /dev/null --request POST \
+          -H "Content-Type: application/json" \
+          --data "${curlData}" \
+          "${callbackURL}"
+    fi
+  done
   popd >/dev/null 2>&1
 }
 
@@ -223,9 +302,6 @@ cleanupOKCheckFiles() {
 
 
 writeHeader() {
-  if [[ "${cgi}" = true ]]; then
-    printf "Content-type: text/html\n\n";
-  fi
   echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">'
   echo '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.5.3/dist/css/bootstrap.min.css" integrity="sha384-TX8t27EcRE3e/ihU7zmQxVncDAy5uIKz4rEkgIXeMed4M0jlfIDPvg6uqKI2xXr2" crossorigin="anonymous">'
   echo "<title>${title}</title>"
@@ -253,8 +329,12 @@ writeFooter() {
 
 # script start 
 
+if [[ "${cgi}" = true ]]; then
+  printf "Content-type: text/html\n\n";
+fi
+
 # Total script duration timer
-start=$(date +%s%3N)
+start=$(${datecmd} +%s%3N)
 
 tmpdir=$(mktemp -d)
 tempfolder=${tmpdir:-/tmp/statusmon/}
@@ -276,11 +356,11 @@ do
 done
 wait 
 
-# header
-writeHeader
-
 # Re-check any failed checks to prevent flapping
 recheckFailedChecks
+
+# header
+writeHeader
 
 # Failed checks, if any, go on top
 writeFailedChecks
@@ -288,15 +368,18 @@ writeFailedChecks
 # Okay checks go below the failed checks
 writeOkayChecks
 
-# Cleanup the status files
-cleanupFailedCheckFiles
-cleanupOKCheckFiles
-
 # stop the total timer
-end=$(date +%s%3N)
+end=$(${datecmd} +%s%3N)
 runtime=$((end-start))
 
 writeFooter
+
+# Execute the callback for any failed URL's
+doCallbackForFailedChecks
+
+# Cleanup the status files
+cleanupFailedCheckFiles
+cleanupOKCheckFiles
 
 popd >/dev/null 2>&1
 
